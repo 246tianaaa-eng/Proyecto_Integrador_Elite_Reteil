@@ -1,0 +1,513 @@
+---
+title: "Fase 3. Análisis estadístico: programa de fidelización de Elite Retail"
+subtitle: "Métodos y Programas Estadísticos para Ciencia de Datos IV — Proyecto Integrador 4to Semestre LCD"
+author: "GRUPO 2"
+date: "`r format(Sys.Date(), '%d/%m/%Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    df_print: paged
+lang: es
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 4.5, dpi = 120)
+options(scipen = 999)
+set.seed(2025)
+
+# install.packages(c("tidyverse","data.table","scales","broom","knitr"))
+install.packages("tidyverse")
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(broom)
+library(knitr)
+# data.table se usa solo con el prefijo data.table:: (para no tapar funciones de lubridate)
+
+theme_set(theme_minimal(base_size = 12))
+azul <- "#2b6cb0"; rojo <- "#c53030"
+```
+
+# Introducción
+
+## Problema y objetivo (Fase 1)
+
+**Problema.** El programa de fidelización de Elite Retail clasifica a los clientes en cuatro niveles
+(Bronze, Silver, Gold y Platinum), pero esos niveles **no reflejan diferencias en el comportamiento de
+compra**. Por eso es difícil saber qué clientes generan más valor y hacia quiénes dirigir los beneficios.
+
+**Objetivo.** Segmentar a los 100,000 clientes con sus compras de 2025, identificar al **20% de clientes con
+mayor gasto** y proponer una clasificación para asignar los beneficios según el valor comercial.
+**KPI principal:** participación en ventas del 20% de clientes con mayor gasto (línea base: ≈ 31%).
+
+## Los tres métodos estadísticos elegidos y por qué
+
+| # | Método | Pregunta que responde | Objetivo de la Fase 1 |
+|---|---|---|---|
+| 1 | **ANOVA de una vía** (con Kruskal-Wallis y Welch como respaldo) | ¿Gastan distinto los clientes de los cuatro niveles? | Obj. 2 y Escenario 1 |
+| 2 | **Prueba chi-cuadrado de independencia** (con V de Cramér) | ¿El nivel actual predice quién es un cliente de alto gasto? Y: ¿quien es de alto gasto en un periodo lo sigue siendo en el siguiente? | Obj. 3 y 4, Escenarios 1 y 2 |
+| 3 | **Análisis de concentración**: curva de Lorenz, coeficiente de Gini e intervalo de confianza bootstrap | ¿Qué tan concentradas están las ventas en pocos clientes? ¿Cuánto pesa el 20% que más gasta? | Obj. 3 y KPI principal |
+
+Estos tres métodos cubren el problema completo: el **1** evalúa la clasificación actual, el **3** mide el
+valor del grupo de mayor gasto y el **2** comprueba si cualquier clasificación (actual o propuesta) sirve
+para orientar beneficios. No se usan otros métodos (regresión, k-means, series de tiempo) porque la
+Fase 1 no los requiere: el criterio de clasificación definido es el gasto anual.
+
+## Guía rápida para leer los resultados
+
+* **Valor p:** si es menor a 0.05, la diferencia observada *probablemente no es casualidad*. Si es mayor,
+  *no hay evidencia de diferencia*.
+* **Tamaño del efecto** (eta², V de Cramér): dice *qué tan grande* es la diferencia. Cerca de 0 = no importa.
+* **Gini:** mide la desigualdad del gasto: 0 = todos gastan igual; 1 = un solo cliente gasta todo.
+* **Intervalo de confianza (IC) al 95%:** rango dentro del cual está, con alta probabilidad, el valor real.
+
+> **Aviso.** Los datos parecen ser sintéticos (generados para un ejercicio académico). Los resultados se
+> presentan como conclusiones **de este conjunto de datos**, no como hechos comprobados de una empresa real.
+
+# Datos y preparación
+
+```{r carga}
+ruta <- "proyecto_integrador"
+leer <- function(f) data.table::fread(file.path(ruta, f)) %>% as_tibble()
+
+ventas    <- leer("sales_raw_oltp.csv")
+clientes  <- leer("customers_master.csv")
+productos <- leer("products_catalog.csv")
+
+# El importe de la venta no viene en la tabla: = cantidad × precio de lista del catálogo
+ventas <- ventas %>%
+  mutate(event_time = as.POSIXct(as.character(event_time), tz = "UTC", format = "%Y-%m-%d %H:%M:%OS"),
+         fecha = as_date(event_time)) %>%
+  left_join(productos %>% select(product_id, retail_price), by = "product_id") %>%
+  mutate(importe = quantity * retail_price,
+         semestre = ifelse(fecha < as.Date("2025-07-01"), "S1", "S2"))
+
+tibble(control = c("Transacciones", "Clientes en el maestro", "Valores nulos en ventas",
+                   "Ventas con cliente inexistente", "Ventas con producto inexistente",
+                   "Periodo de las ventas"),
+       resultado = c(comma(nrow(ventas)), comma(nrow(clientes)), sum(is.na(ventas)),
+                     sum(!ventas$customer_id %in% clientes$customer_id),
+                     sum(!ventas$product_id %in% productos$product_id),
+                     paste(min(ventas$fecha), "a", max(ventas$fecha)))) %>%
+  kable(caption = "Controles de calidad")
+```
+
+## Gasto anual por cliente
+
+Se calcula el **gasto anual de cada cliente** (suma de sus compras de 2025). Se incluyen los 100,000
+clientes del maestro; los pocos que no compraron quedan con gasto 0.
+
+```{r gasto}
+gasto <- ventas %>% group_by(customer_id) %>%
+  summarise(gasto = sum(importe), compras = n(), unidades = sum(quantity),
+            gasto_s1 = sum(importe[semestre == "S1"]),
+            gasto_s2 = sum(importe[semestre == "S2"]), .groups = "drop")
+
+cli <- clientes %>%
+  transmute(customer_id, nivel_actual = factor(loyalty_tier, levels = c("Bronze","Silver","Gold","Platinum"))) %>%
+  left_join(gasto, by = "customer_id") %>%
+  mutate(across(c(gasto, compras, unidades, gasto_s1, gasto_s2), ~ replace_na(.x, 0)),
+         ticket = ifelse(compras > 0, gasto / compras, NA_real_))
+
+N <- nrow(cli); k20 <- N * 0.20
+cli <- cli %>% mutate(
+  top20    = rank(-gasto,    ties.method = "first") <= k20,   # 20% de mayor gasto en el año
+  top20_s1 = rank(-gasto_s1, ties.method = "first") <= k20,   # ... en el primer semestre
+  top20_s2 = rank(-gasto_s2, ties.method = "first") <= k20)   # ... en el segundo semestre
+
+ventas_totales <- sum(cli$gasto)
+
+tibble(indicador = c("Clientes", "Clientes sin compras", "Ventas totales 2025", "Gasto medio por cliente",
+                     "Gasto mediano", "Gasto mínimo", "Gasto máximo"),
+       valor = c(comma(N), sum(cli$gasto == 0), comma(ventas_totales, 1), comma(mean(cli$gasto), 1),
+                 comma(median(cli$gasto), 1), comma(min(cli$gasto), 1), comma(max(cli$gasto), 1))) %>%
+  kable(caption = "Resumen del gasto anual por cliente")
+```
+
+```{r hist}
+umbral <- min(cli$gasto[cli$top20])
+ggplot(cli %>% filter(gasto > 0), aes(gasto)) +
+  geom_histogram(bins = 50, fill = azul, color = "white") +
+  geom_vline(xintercept = mean(cli$gasto), color = "black", linetype = "dashed") +
+  geom_vline(xintercept = umbral, color = rojo, linewidth = 1) +
+  scale_x_continuous(labels = comma) +
+  labs(title = "Gráfico 1. Distribución del gasto anual por cliente",
+       subtitle = "Línea punteada: gasto medio. Línea roja: desde aquí está el 20% de mayor gasto",
+       x = "Gasto anual del cliente", y = "Número de clientes")
+```
+
+> **Cómo leerlo.** Cada barra cuenta cuántos clientes gastaron una cantidad parecida en el año. La línea roja
+> separa al 20% que más gastó (a su derecha) del resto.
+>
+> **Qué significa para Elite Retail.** El cliente típico gasta unos **84,000 al año** (media de 86,200) y la
+> gran mayoría está entre 63,000 y 107,000. La forma es una campana con una cola leve a la derecha: **no hay
+> un pequeño grupo de "súper clientes"** muy separado del resto. Para entrar al 20% de mayor gasto hay que
+> superar los **112,600 al año**, apenas 30% más que el gasto medio.
+
+# Método 1: ANOVA de una vía. ¿Gastan distinto los niveles de fidelización?
+
+**Idea simple.** El ANOVA compara el gasto promedio de varios grupos y pregunta si las diferencias que se
+ven son reales o producto del azar. **H₀:** los cuatro niveles gastan en promedio lo mismo.
+Es la prueba del Escenario 1 (clasificación actual).
+
+```{r anova}
+cli %>% group_by(nivel_actual) %>%
+  summarise(clientes = n(), gasto_medio = mean(gasto), gasto_mediano = median(gasto),
+            desv_est = sd(gasto), compras_medias = mean(compras),
+            ticket_medio = mean(ticket, na.rm = TRUE), .groups = "drop") %>%
+  kable(digits = 1, format.args = list(big.mark = ","), caption = "Gasto y comportamiento por nivel de fidelización")
+
+ggplot(cli, aes(nivel_actual, gasto)) +
+  geom_boxplot(fill = "#bee3f8", outlier.alpha = .15) +
+  stat_summary(fun = mean, geom = "point", shape = 23, fill = "white", size = 3) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Gráfico 2. Gasto anual por cliente según el nivel de fidelización",
+       subtitle = "Rombo blanco: gasto medio", x = NULL, y = "Gasto anual")
+```
+
+> **Cómo leerlo.** Cada caja resume a los clientes de un nivel: la línea central es el cliente típico
+> (mediana) y la caja contiene a la mitad central de sus clientes. Si el programa funcionara, las cajas
+> de Silver, Gold y Platinum estarían cada vez más arriba.
+>
+> **Qué significa para Elite Retail.** Las cuatro cajas están **a la misma altura**: la mediana ronda los
+> 83,700 en todos los niveles y la media va de 86,089 (Bronze) a 86,402 (Silver), una diferencia de
+> **0.4%**. Un cliente Platinum gasta lo mismo que uno Bronze. Esto confirma, con datos, el problema
+> planteado en la Fase 1.
+
+```{r anova-test}
+m_aov <- aov(gasto ~ nivel_actual, data = cli)
+tab <- tidy(m_aov)
+tab %>% kable(digits = 5, caption = "Tabla ANOVA: gasto anual según nivel de fidelización")
+
+ss <- tab$sumsq
+cat("eta cuadrado =", format(ss[1] / sum(ss), digits = 3), "\n\n")
+
+oneway.test(gasto ~ nivel_actual, data = cli)      # ANOVA de Welch (no asume varianzas iguales)
+kruskal.test(gasto ~ nivel_actual, data = cli)     # prueba no paramétrica (no asume normalidad)
+
+# ¿Cambia la conclusión si en vez del gasto miramos sus dos componentes?
+comparar <- function(var, etiqueta) {
+  t <- tidy(aov(as.formula(paste(var, "~ nivel_actual")), data = cli))
+  tibble(variable = etiqueta, F = round(t$statistic[1], 2), valor_p = round(t$p.value[1], 3))
+}
+bind_rows(comparar("gasto", "Gasto anual"), comparar("compras", "Número de compras"),
+          comparar("ticket", "Gasto por compra (ticket)")) %>%
+  mutate(conclusion = ifelse(valor_p < 0.05, "Hay diferencia", "No hay diferencia")) %>%
+  kable(caption = "ANOVA para el gasto y sus componentes")
+```
+
+> **Interpretación del Método 1.**
+>
+> * **Resultado:** F = 0.48 y **p = 0.70**. Como p es mucho mayor que 0.05, **no hay evidencia de que el gasto
+>   promedio difiera entre niveles**. Las pruebas de respaldo coinciden (Welch y Kruskal-Wallis, p = 0.80).
+> * **Tamaño del efecto:** eta² ≈ 0.00001. El nivel de fidelización explica **menos del 0.002%** de las
+>   diferencias de gasto entre clientes. Es prácticamente cero.
+> * **Componentes:** tampoco hay diferencias en el número de compras (≈10 al año en todos los niveles,
+>   p = 0.17) ni en el gasto por compra (≈8,600, p = 0.60).
+> * **Para el negocio:** el nivel actual **no sirve como criterio de valor**. Hoy los beneficios de
+>   Platinum se estarían dando a clientes que no gastan más que los de Bronze.
+
+# Método 2: Chi-cuadrado de independencia. ¿Sirve una clasificación para encontrar a los clientes de alto valor?
+
+**Idea simple.** La prueba chi-cuadrado revisa si dos categorías están relacionadas. Aquí las usamos de dos
+formas: **(a)** ¿el nivel actual está relacionado con ser del 20% de mayor gasto? y **(b)** ¿ser del 20% de
+mayor gasto en un periodo está relacionado con serlo en el siguiente? La segunda pregunta es la que dice
+si una clasificación por gasto **sirve para decidir beneficios a futuro**.
+
+## (a) Nivel actual vs. pertenecer al 20% de mayor gasto
+
+```{r chi-a}
+cramer_v <- function(tab) {
+  chi <- suppressWarnings(chisq.test(tab, correct = FALSE))$statistic
+  unname(sqrt(chi / (sum(tab) * (min(dim(tab)) - 1))))
+}
+
+tab_a <- table(cli$nivel_actual, cli$top20, dnn = c("Nivel", "Top 20%"))
+tab_a
+chisq.test(tab_a)
+cat("V de Cramér =", round(cramer_v(tab_a), 4), "\n")
+
+tasa_a <- cli %>% group_by(nivel_actual) %>%
+  summarise(clientes = n(), en_top20 = sum(top20), porcentaje = mean(top20), .groups = "drop")
+
+ggplot(tasa_a, aes(nivel_actual, porcentaje)) +
+  geom_col(fill = azul) +
+  geom_hline(yintercept = 0.20, linetype = "dashed", color = rojo) +
+  geom_text(aes(label = percent(porcentaje, 0.1)), vjust = -0.4) +
+  scale_y_continuous(labels = percent, limits = c(0, 0.30)) +
+  labs(title = "Gráfico 3. Porcentaje de clientes del 20% de mayor gasto, por nivel actual",
+       subtitle = "Línea roja: 20%, lo esperado si el nivel no tuviera relación con el gasto",
+       x = NULL, y = "% de clientes que son del 20% de mayor gasto")
+```
+
+> **Cómo leerlo.** Cada barra indica qué porcentaje de los clientes de ese nivel está entre los que más
+> gastan. Si el programa identificara bien a los clientes valiosos, la barra de Platinum sería mucho más alta
+> que la de Bronze. La línea roja (20%) es lo que pasaría por pura casualidad.
+>
+> **Qué significa para Elite Retail.** Las cuatro barras están **pegadas a la línea roja**: 19.9% en Bronze y
+> en Platinum, 20.1% en Gold y 20.2% en Silver. Solo **4,948 de los 24,926 clientes Platinum** están en el
+> 20% que más gasta; en Bronze son 4,966. La prueba da χ² = 1.04, **p = 0.79** y V de Cramér = 0.003 (relación
+> nula). **Ser Platinum no aumenta la probabilidad de ser un cliente de alto gasto.** Es el
+> mismo resultado del Método 1 desde otro ángulo, y muestra que los beneficios actuales no están llegando
+> de forma preferente a los mejores clientes.
+
+## (b) ¿Es persistente el alto gasto? Primer semestre vs. segundo semestre
+
+Para que una clasificación por gasto sirva para repartir beneficios, los clientes que gastan mucho hoy
+deberían seguir gastando mucho después. Se divide 2025 en dos semestres: ¿los del 20% de mayor gasto en
+enero-junio vuelven a estar en el 20% de mayor gasto en julio-diciembre?
+
+```{r chi-b}
+tab_b <- table(`Top 20% en S1 (ene-jun)` = cli$top20_s1, `Top 20% en S2 (jul-dic)` = cli$top20_s2)
+tab_b
+chisq.test(tab_b)
+cat("V de Cramér =", round(cramer_v(tab_b), 4), "\n\n")
+cor.test(cli$gasto_s1, cli$gasto_s2)
+
+persist <- tibble(
+  grupo = c("Estuvieron en el top 20% en S1", "No estuvieron en el top 20% en S1"),
+  porcentaje = c(mean(cli$top20_s2[cli$top20_s1]), mean(cli$top20_s2[!cli$top20_s1])))
+
+ggplot(persist, aes(grupo, porcentaje)) +
+  geom_col(fill = azul, width = .5) +
+  geom_hline(yintercept = 0.20, linetype = "dashed", color = rojo) +
+  geom_text(aes(label = percent(porcentaje, 0.1)), vjust = -0.4) +
+  scale_y_continuous(labels = percent, limits = c(0, 0.30)) +
+  labs(title = "Gráfico 4. ¿Quién gasta mucho en el primer semestre vuelve a gastar mucho en el segundo?",
+       subtitle = "% de clientes que son top 20% en el segundo semestre. Línea roja: 20% (puro azar)",
+       x = NULL, y = "% que es top 20% en S2")
+
+# Dispersión de las compras por cliente: si media ≈ varianza, las compras se comportan como "azar puro"
+tibble(media_compras = mean(cli$compras), varianza_compras = var(cli$compras)) %>% kable(digits = 2)
+
+# Mismo análisis por nivel actual: ¿los Platinum de S1 gastan más en S2?
+cli %>% group_by(nivel_actual) %>% summarise(`% top 20% en S2` = percent(mean(top20_s2), 0.1)) %>% kable()
+```
+
+> **Cómo leerlo.** La primera barra muestra, entre quienes estaban en el 20% de mayor gasto del primer
+> semestre, qué porcentaje repitió en el segundo. La segunda barra es lo mismo para quienes no estaban.
+> Si el alto gasto fuera una característica del cliente, la primera barra sería mucho más alta.
+>
+> **Qué significa para Elite Retail.** Las dos barras son iguales y están en la línea roja: **19.8%** de los
+> que eran top 20% repiten, frente a **20.0%** de los demás (p = 0.47). La correlación entre el gasto de los
+> dos semestres es **−0.001 (p = 0.83)**: lo que un cliente gastó en el primer semestre no dice nada de lo
+> que gastará en el segundo. Además, el número de compras por cliente tiene media ≈ varianza (≈ 10), lo
+> típico de eventos que ocurren **al azar** con la misma probabilidad para todos.
+>
+> **En palabras simples:** en estos datos, el cliente que "más gastó" en un periodo lo hizo por una
+> racha, no porque sea de otro tipo. **Esto es el hallazgo más importante para la propuesta**: clasificar por
+> gasto del año pasado identifica correctamente quién gastó más *ese año*, pero **no predice** quién gastará
+> más el siguiente. Más abajo se explica qué implica esto para diseñar los beneficios.
+
+# Método 3: Análisis de concentración (Lorenz, Gini y bootstrap). ¿Cuánto pesa el 20% que más gasta?
+
+**Idea simple.** La **curva de Lorenz** ordena a los clientes de menor a mayor gasto y muestra qué
+porcentaje de las ventas acumulan. Si todos gastaran igual, sería una diagonal. El **Gini** resume en un
+solo número qué tan lejos está de esa diagonal. El **bootstrap** repite el cálculo 300 veces con
+remuestreos de los clientes para obtener un intervalo de confianza.
+
+```{r concentracion}
+gini <- function(y) { y <- sort(y); n <- length(y); 2 * sum(seq_len(n) * y) / (n * sum(y)) - (n + 1) / n }
+share_top <- function(y, p = 0.20) { y <- sort(y, decreasing = TRUE); sum(y[1:floor(length(y) * p)]) / sum(y) }
+
+kpi <- tibble(
+  indicador = c("Clientes del 20% de mayor gasto", "Umbral de gasto para entrar al 20%",
+                "Ventas del 20% de mayor gasto", "Participación en ventas (KPI principal)",
+                "Coeficiente de Gini"),
+  valor = c(comma(sum(cli$top20)), comma(umbral, 1), comma(sum(cli$gasto[cli$top20]), 1),
+            percent(share_top(cli$gasto), 0.01), round(gini(cli$gasto), 3)))
+kable(kpi, caption = "KPI principal de la Fase 1")
+
+B <- 300
+boot <- map_dfr(seq_len(B), function(b) {
+  yb <- sample(cli$gasto, replace = TRUE)
+  tibble(gini = gini(yb), participacion = share_top(yb))
+})
+boot %>% summarise(across(everything(), list(inf = ~ quantile(.x, .025), sup = ~ quantile(.x, .975)))) %>%
+  pivot_longer(everything(), names_to = c("medida", "limite"), names_sep = "_") %>%
+  pivot_wider(names_from = limite, values_from = value) %>%
+  kable(digits = 4, caption = "Intervalo de confianza bootstrap al 95%")
+```
+
+```{r lorenz}
+lorenz <- cli %>% arrange(gasto) %>%
+  mutate(pct_clientes = row_number() / n(), pct_ventas = cumsum(gasto) / sum(gasto)) %>%
+  filter(row_number() %% 100 == 0)
+base80 <- lorenz %>% filter(abs(pct_clientes - 0.80) < 1e-9) %>% pull(pct_ventas)
+
+ggplot(lorenz, aes(pct_clientes, pct_ventas)) +
+  geom_area(fill = "#bee3f8", alpha = .6) +
+  geom_line(color = azul, linewidth = 1.1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+  geom_vline(xintercept = 0.8, color = rojo, linetype = "dotted") +
+  annotate("text", x = 0.79, y = base80 + 0.07, hjust = 1, color = rojo,
+           label = paste0("El 80% que menos gasta\nacumula ", percent(base80, 0.1), " de las ventas")) +
+  scale_x_continuous(labels = percent) + scale_y_continuous(labels = percent) +
+  labs(title = "Gráfico 5. Curva de Lorenz del gasto anual por cliente",
+       subtitle = "Línea punteada gris: reparto perfectamente igual",
+       x = "% acumulado de clientes (de menor a mayor gasto)", y = "% acumulado de las ventas")
+```
+
+> **Cómo leerlo.** La línea azul acumula las ventas de los clientes ordenados de menor a mayor gasto. Cuanto
+> más se aleje hacia abajo de la diagonal gris, más concentradas están las ventas en pocos clientes.
+>
+> **Qué significa para Elite Retail.**
+>
+> * **El KPI se confirma:** el 20% de clientes con mayor gasto (20,000 clientes) genera **2,676 millones, es
+>   decir, 31.0% de las ventas** (IC 95%: 30.98%–31.09%), igual a la línea base de la Fase 1 (≈ 31%).
+> * **La concentración es baja.** El Gini es **0.21** (IC 95%: 0.208–0.210). La curva está cerca de la
+>   diagonal: el 80% que menos gasta aún acumula **69% de las ventas**. Si las ventas estuvieran muy
+>   concentradas (la clásica regla 80/20), el 20% de arriba aportaría ~80%, no 31%.
+> * **Lectura para el negocio:** hay clientes de mayor valor, pero **la diferencia es moderada**: 20% de los
+>   clientes aporta 31% de las ventas, no la mayoría. Por eso no conviene concentrar *todos* los beneficios
+>   en ese grupo.
+
+## Comparación de escenarios: clasificación actual vs. clasificación por gasto
+
+```{r escenarios}
+top_k <- function(k) sum(sort(cli$gasto, decreasing = TRUE)[1:k]) / ventas_totales
+niv <- function(n) sum(cli$gasto[cli$nivel_actual %in% n]) / ventas_totales
+k_p  <- sum(cli$nivel_actual == "Platinum")
+k_gp <- sum(cli$nivel_actual %in% c("Gold", "Platinum"))
+
+captura <- tribble(
+  ~grupo,                       ~criterio,                             ~clientes, ~part_ventas,
+  "Grupo de ~25% de clientes",  "Escenario 1: nivel Platinum",         k_p,       niv("Platinum"),
+  "Grupo de ~25% de clientes",  "Escenario 2: top 25% por gasto",      k_p,       top_k(k_p),
+  "Grupo de ~50% de clientes",  "Escenario 1: niveles Gold + Platinum", k_gp,     niv(c("Gold","Platinum")),
+  "Grupo de ~50% de clientes",  "Escenario 2: top 50% por gasto",      k_gp,      top_k(k_gp))
+
+captura %>% mutate(clientes = comma(clientes), part_ventas = percent(part_ventas, 0.1)) %>%
+  kable(caption = "Ventas que concentra cada grupo de clientes según el criterio de clasificación")
+
+ggplot(captura, aes(criterio, part_ventas, fill = str_detect(criterio, "Escenario 2"))) +
+  geom_col(show.legend = FALSE, width = .6) +
+  geom_text(aes(label = percent(part_ventas, 0.1)), vjust = -0.4) +
+  facet_wrap(~ grupo, scales = "free_x") +
+  scale_fill_manual(values = c("grey60", azul)) +
+  scale_y_continuous(labels = percent, limits = c(0, 0.8)) +
+  labs(title = "Gráfico 6. Participación en ventas: clasificación actual vs. clasificación por gasto",
+       x = NULL, y = "% de las ventas totales") +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+```
+
+> **Cómo leerlo.** Para un mismo número de clientes, se compara cuánto de las ventas concentra el grupo
+> elegido por nivel (gris) contra el elegido por gasto (azul).
+>
+> **Qué significa para Elite Retail.** El nivel Platinum (25% de los clientes) concentra **24.9%** de las
+> ventas, exactamente lo que le tocaría por tamaño: no destaca. El 25% que más gasta concentra **37.3%**, y
+> el 50% que más gasta, **64.8%** (frente a 50.0% de Gold + Platinum). La clasificación por gasto
+> es claramente más informativa **para describir el año 2025**.
+>
+> **Ojo con esta lectura:** esta ventaja es en parte automática, porque ordenar por gasto de un periodo
+> siempre captura más gasto *de ese periodo*. La verdadera prueba de utilidad hacia adelante es la del
+> Gráfico 4, y ahí no hay persistencia. Las dos cosas deben leerse juntas.
+
+## Clasificación propuesta (Objetivo 4)
+
+Se propone reemplazar los niveles actuales por **cuatro niveles basados en el gasto anual** (percentiles),
+que incluyen el 20% de mayor valor definido en el objetivo SMART.
+
+```{r clasificacion}
+cli <- cli %>% mutate(
+  pos = rank(-gasto, ties.method = "first") / n(),
+  nivel_propuesto = cut(pos, breaks = c(0, .2, .5, .8, 1), include.lowest = TRUE,
+                        labels = c("A. Alto valor (top 20%)", "B. Valor medio-alto (20%-50%)",
+                                   "C. Valor medio-bajo (50%-80%)", "D. Bajo valor (80%-100%)")))
+
+perfil <- cli %>% group_by(nivel_propuesto) %>%
+  summarise(clientes = n(), gasto_desde = min(gasto), gasto_hasta = max(gasto),
+            gasto_medio = mean(gasto), compras_medias = mean(compras),
+            ticket_medio = mean(ticket, na.rm = TRUE), ventas = sum(gasto), .groups = "drop") %>%
+  mutate(pct_clientes = clientes / sum(clientes), pct_ventas = ventas / sum(ventas))
+
+perfil %>% transmute(nivel = nivel_propuesto, clientes = comma(clientes),
+                     `gasto anual desde` = comma(gasto_desde, 1), `hasta` = comma(gasto_hasta, 1),
+                     `gasto medio` = comma(gasto_medio, 1), `compras al año` = round(compras_medias, 1),
+                     `gasto por compra` = comma(ticket_medio, 1),
+                     `% de las ventas` = percent(pct_ventas, 0.1)) %>%
+  kable(caption = "Perfil de los niveles propuestos")
+
+perfil %>% select(nivel_propuesto, pct_clientes, pct_ventas) %>%
+  pivot_longer(-nivel_propuesto, names_to = "medida", values_to = "valor") %>%
+  mutate(medida = recode(medida, pct_clientes = "% de clientes", pct_ventas = "% de las ventas")) %>%
+  ggplot(aes(nivel_propuesto, valor, fill = medida)) +
+  geom_col(position = "dodge") +
+  geom_text(aes(label = percent(valor, 1)), position = position_dodge(.9), vjust = -0.3, size = 3.2) +
+  scale_y_continuous(labels = percent, expand = expansion(mult = c(0, .12))) +
+  scale_fill_manual(values = c("grey60", azul)) +
+  labs(title = "Gráfico 7. Peso de cada nivel propuesto: clientes vs. ventas",
+       x = NULL, y = NULL, fill = NULL) +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+
+table(Propuesto = cli$nivel_propuesto, Actual = cli$nivel_actual) %>% prop.table(1) %>% round(3)
+
+# Qué distingue al top 20%: más compras o compras más grandes
+cli %>% group_by(grupo = ifelse(top20, "Top 20%", "Resto")) %>%
+  summarise(compras = mean(compras), ticket = mean(ticket, na.rm = TRUE), unidades = mean(unidades)) %>%
+  kable(digits = 1, caption = "¿Qué distingue al 20% de mayor gasto?")
+
+dir.create("salidas", showWarnings = FALSE)
+cli %>% select(customer_id, nivel_actual, gasto, compras, nivel_propuesto, top20) %>%
+  write_csv("salidas/clientes_clasificados.csv")
+```
+
+> **Cómo leerlo.** El Gráfico 7 compara qué parte de los clientes y qué parte de las ventas tiene cada nivel
+> propuesto. La tabla indica el rango de gasto que define a cada nivel y cómo se comportan sus clientes.
+>
+> **Qué significa para Elite Retail.**
+>
+> * **Nivel A (20,000 clientes, desde 112,608 de gasto anual):** concentra 31.0% de las ventas. Compran
+>   **~14 veces al año** frente a ~9 del resto, y con un ticket ~18% mayor (9,798 vs. 8,329). Es decir, la
+>   **frecuencia de compra es lo que más los distingue**.
+> * **Nivel B (30,000 clientes):** es el grupo más importante en ventas (33.8%) con ~11 compras al año.
+> * **Nivel C (30,000 clientes, 24.9% de ventas)** y **Nivel D (20,000 clientes, solo 10.3% de las
+>   ventas, ~6 compras al año):** clientes de menor valor, con espacio para estimular más compras.
+> * **Los niveles propuestos son independientes de los actuales:** cada uno tiene ~25% de clientes de
+>   cada nivel Bronze/Silver/Gold/Platinum. Adoptarlos implicaría una **reasignación real** de beneficios.
+> * La tabla de clasificación por cliente queda guardada en `salidas/clientes_clasificados.csv`.
+
+# Conclusiones y recomendaciones
+
+**Respuesta a los objetivos de la Fase 1**
+
+1. **Gasto anual (Obj. 1).** El cliente típico gasta ≈ 84,000 al año (media 86,200); las ventas de 2025 suman
+   ≈ 8,622 millones.
+2. **Niveles actuales (Obj. 2, Método 1).** **No hay diferencias de gasto entre Bronze, Silver, Gold y Platinum**
+   (ANOVA p = 0.70; eta² ≈ 0). Tampoco en número de compras ni en gasto por compra.
+3. **Top 20% (Obj. 3, Método 3).** El 20% de mayor gasto (20,000 clientes) aporta **31.0% de las ventas**
+   (IC 95%: 31.0%–31.1%), coherente con la línea base. La concentración es baja (Gini = 0.21).
+4. **Clasificación (Obj. 4, Métodos 2 y 3).** Los niveles actuales **no identifican** a los clientes de alto
+   gasto (chi-cuadrado p = 0.79). Se propone una clasificación por gasto en cuatro niveles (A, B, C, D).
+
+**Hallazgo clave y su implicación.** El Método 2 muestra que **el alto gasto no es persistente**: ser del
+20% que más gasta en un semestre no aumenta la probabilidad de serlo en el siguiente (19.8% frente a 20.0%).
+Por eso se recomienda:
+
+* **Usar la clasificación por gasto como una medición descriptiva del periodo, y recalcularla
+  periódicamente** (por ejemplo, trimestral o con una ventana móvil de 12 meses), en lugar de asignar
+  un nivel fijo para todo un año.
+* **Vincular los beneficios al gasto efectivamente realizado**: por ejemplo, recompensas por alcanzar
+  umbrales de gasto o de número de compras (la frecuencia es el principal diferenciador del Nivel A).
+* **No concentrar todos los beneficios en el 20% superior:** aporta 31% de las ventas, mientras que
+  el Nivel B aporta 34%.
+* **Validar antes de implementar** con más de un año de historia y con información de costos de las
+  recompensas, que hoy no está disponible (Fase 1, sección 3.2).
+
+**Limitaciones**
+
+* Los datos parecen sintéticos: las conclusiones son del conjunto de datos académico, no de una empresa real.
+* El importe de venta se calcula con el precio de lista del catálogo (la tabla de ventas no trae precio).
+* Se analiza un solo año; la persistencia solo se pudo probar entre dos semestres de 2025.
+* No se dispone del costo de los beneficios, por lo que no se estima su rentabilidad.
+* Los resultados muestran asociaciones y no causas.
+
+# Entorno
+
+```{r sesion}
+sessionInfo()
+```
