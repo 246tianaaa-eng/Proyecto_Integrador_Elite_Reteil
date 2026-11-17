@@ -9,4 +9,4 @@ En esta carpeta se guardarán:
 - Objetivos del proyecto.
 - Requerimientos de información.
 - Indicadores clave (KPIs).
-- 
+  
